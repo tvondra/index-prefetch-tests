@@ -1,0 +1,1105 @@
+diff --git a/src/backend/access/gist/gistget.c b/src/backend/access/gist/gistget.c
+index e2c9b5f069c..9045c6eb7aa 100644
+--- a/src/backend/access/gist/gistget.c
++++ b/src/backend/access/gist/gistget.c
+@@ -678,7 +678,6 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
+ 					scan->xs_hitup = so->pageData[so->curPageData].recontup;
+ 
+ 				so->curPageData++;
+-
+ 				return true;
+ 			}
+ 
+diff --git a/src/backend/access/heap/heapam_handler.c b/src/backend/access/heap/heapam_handler.c
+index 0755be83901..f0412da94ae 100644
+--- a/src/backend/access/heap/heapam_handler.c
++++ b/src/backend/access/heap/heapam_handler.c
+@@ -44,6 +44,7 @@
+ #include "storage/smgr.h"
+ #include "utils/builtins.h"
+ #include "utils/rel.h"
++#include "utils/spccache.h"
+ 
+ static void reform_and_rewrite_tuple(HeapTuple tuple,
+ 									 Relation OldHeap, Relation NewHeap,
+@@ -751,6 +752,9 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
+ 			PROGRESS_CLUSTER_INDEX_RELID
+ 		};
+ 		int64		ci_val[2];
++		int			prefetch_target;
++
++		prefetch_target = get_tablespace_io_concurrency(OldHeap->rd_rel->reltablespace);
+ 
+ 		/* Set phase and OIDOldIndex to columns */
+ 		ci_val[0] = PROGRESS_CLUSTER_PHASE_INDEX_SCAN_HEAP;
+@@ -759,7 +763,8 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
+ 
+ 		tableScan = NULL;
+ 		heapScan = NULL;
+-		indexScan = index_beginscan(OldHeap, OldIndex, SnapshotAny, 0, 0);
++		indexScan = index_beginscan(OldHeap, OldIndex, SnapshotAny, 0, 0,
++									prefetch_target, prefetch_target);
+ 		index_rescan(indexScan, NULL, 0, NULL, 0);
+ 	}
+ 	else
+diff --git a/src/backend/access/index/genam.c b/src/backend/access/index/genam.c
+index 722927aebab..264ebe1d8e5 100644
+--- a/src/backend/access/index/genam.c
++++ b/src/backend/access/index/genam.c
+@@ -126,6 +126,9 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
+ 	scan->xs_hitup = NULL;
+ 	scan->xs_hitupdesc = NULL;
+ 
++	/* set in each AM when applicable */
++	scan->xs_prefetch = NULL;
++
+ 	return scan;
+ }
+ 
+@@ -440,8 +443,9 @@ systable_beginscan(Relation heapRelation,
+ 				elog(ERROR, "column is not in index");
+ 		}
+ 
++		/* no index prefetch for system catalogs */
+ 		sysscan->iscan = index_beginscan(heapRelation, irel,
+-										 snapshot, nkeys, 0);
++										 snapshot, nkeys, 0, 0, 0);
+ 		index_rescan(sysscan->iscan, key, nkeys, NULL, 0);
+ 		sysscan->scan = NULL;
+ 	}
+@@ -696,8 +700,9 @@ systable_beginscan_ordered(Relation heapRelation,
+ 			elog(ERROR, "column is not in index");
+ 	}
+ 
++	/* no index prefetch for system catalogs */
+ 	sysscan->iscan = index_beginscan(heapRelation, indexRelation,
+-									 snapshot, nkeys, 0);
++									 snapshot, nkeys, 0, 0, 0);
+ 	index_rescan(sysscan->iscan, key, nkeys, NULL, 0);
+ 	sysscan->scan = NULL;
+ 
+diff --git a/src/backend/access/index/indexam.c b/src/backend/access/index/indexam.c
+index b25b03f7abc..3722874948f 100644
+--- a/src/backend/access/index/indexam.c
++++ b/src/backend/access/index/indexam.c
+@@ -54,11 +54,13 @@
+ #include "catalog/pg_amproc.h"
+ #include "catalog/pg_type.h"
+ #include "commands/defrem.h"
++#include "common/hashfn.h"
+ #include "nodes/makefuncs.h"
+ #include "pgstat.h"
+ #include "storage/bufmgr.h"
+ #include "storage/lmgr.h"
+ #include "storage/predicate.h"
++#include "utils/lsyscache.h"
+ #include "utils/ruleutils.h"
+ #include "utils/snapmgr.h"
+ #include "utils/syscache.h"
+@@ -106,7 +108,10 @@ do { \
+ 
+ static IndexScanDesc index_beginscan_internal(Relation indexRelation,
+ 											  int nkeys, int norderbys, Snapshot snapshot,
+-											  ParallelIndexScanDesc pscan, bool temp_snap);
++											  ParallelIndexScanDesc pscan, bool temp_snap,
++											  int prefetch_target, int prefetch_reset);
++
++static void index_prefetch(IndexScanDesc scan, ItemPointer tid);
+ 
+ 
+ /* ----------------------------------------------------------------
+@@ -200,18 +205,36 @@ index_insert(Relation indexRelation,
+  * index_beginscan - start a scan of an index with amgettuple
+  *
+  * Caller must be holding suitable locks on the heap and the index.
++ *
++ * prefetch_target determines if prefetching is requested for this index scan.
++ * We need to be able to disable this for two reasons. Firstly, we don't want
++ * to do prefetching for IOS (where we hope most of the heap pages won't be
++ * really needed. Secondly, we must prevent infinite loop when determining
++ * prefetch value for the tablespace - the get_tablespace_io_concurrency()
++ * does an index scan internally, which would result in infinite loop. So we
++ * simply disable prefetching in systable_beginscan().
++ *
++ * XXX Maybe we should do prefetching even for catalogs, but then disable it
++ * when accessing TableSpaceRelationId. We still need the ability to disable
++ * this and catalogs are expected to be tiny, so prefetching is unlikely to
++ * make a difference.
++ *
++ * XXX The second reason doesn't really apply after effective_io_concurrency
++ * lookup moved to caller of index_beginscan.
+  */
+ IndexScanDesc
+ index_beginscan(Relation heapRelation,
+ 				Relation indexRelation,
+ 				Snapshot snapshot,
+-				int nkeys, int norderbys)
++				int nkeys, int norderbys,
++				int prefetch_target, int prefetch_reset)
+ {
+ 	IndexScanDesc scan;
+ 
+ 	Assert(snapshot != InvalidSnapshot);
+ 
+-	scan = index_beginscan_internal(indexRelation, nkeys, norderbys, snapshot, NULL, false);
++	scan = index_beginscan_internal(indexRelation, nkeys, norderbys, snapshot, NULL, false,
++									prefetch_target, prefetch_reset);
+ 
+ 	/*
+ 	 * Save additional parameters into the scandesc.  Everything else was set
+@@ -241,7 +264,8 @@ index_beginscan_bitmap(Relation indexRelation,
+ 
+ 	Assert(snapshot != InvalidSnapshot);
+ 
+-	scan = index_beginscan_internal(indexRelation, nkeys, 0, snapshot, NULL, false);
++	scan = index_beginscan_internal(indexRelation, nkeys, 0, snapshot, NULL, false,
++									0, 0); /* no prefetch */
+ 
+ 	/*
+ 	 * Save additional parameters into the scandesc.  Everything else was set
+@@ -258,7 +282,8 @@ index_beginscan_bitmap(Relation indexRelation,
+ static IndexScanDesc
+ index_beginscan_internal(Relation indexRelation,
+ 						 int nkeys, int norderbys, Snapshot snapshot,
+-						 ParallelIndexScanDesc pscan, bool temp_snap)
++						 ParallelIndexScanDesc pscan, bool temp_snap,
++						 int prefetch_target, int prefetch_reset)
+ {
+ 	IndexScanDesc scan;
+ 
+@@ -276,12 +301,27 @@ index_beginscan_internal(Relation indexRelation,
+ 	/*
+ 	 * Tell the AM to open a scan.
+ 	 */
+-	scan = indexRelation->rd_indam->ambeginscan(indexRelation, nkeys,
+-												norderbys);
++	scan = indexRelation->rd_indam->ambeginscan(indexRelation, nkeys, norderbys);
+ 	/* Initialize information for parallel scan. */
+ 	scan->parallel_scan = pscan;
+ 	scan->xs_temp_snap = temp_snap;
+ 
++	/* with prefetching enabled, initialize the necessary state */
++	if (prefetch_target > 0)
++	{
++		IndexPrefetch prefetcher = palloc0(sizeof(IndexPrefetchData));
++
++		prefetcher->queueIndex = 0;
++		prefetcher->queueStart = 0;
++		prefetcher->queueEnd = 0;
++
++		prefetcher->prefetchTarget = 0;
++		prefetcher->prefetchMaxTarget = prefetch_target;
++		prefetcher->prefetchReset = prefetch_reset;
++
++		scan->xs_prefetch = prefetcher;
++	}
++
+ 	return scan;
+ }
+ 
+@@ -317,6 +357,20 @@ index_rescan(IndexScanDesc scan,
+ 
+ 	scan->indexRelation->rd_indam->amrescan(scan, keys, nkeys,
+ 											orderbys, norderbys);
++
++	/* If we're prefetching for this index, maybe reset some of the state. */
++	if (scan->xs_prefetch != NULL)
++	{
++		IndexPrefetch prefetcher = scan->xs_prefetch;
++
++		prefetcher->queueStart = 0;
++		prefetcher->queueEnd = 0;
++		prefetcher->queueIndex = 0;
++		prefetcher->prefetchDone = false;
++	
++		prefetcher->prefetchTarget = Min(prefetcher->prefetchTarget,
++										 prefetcher->prefetchReset);
++	}
+ }
+ 
+ /* ----------------
+@@ -345,6 +399,17 @@ index_endscan(IndexScanDesc scan)
+ 	if (scan->xs_temp_snap)
+ 		UnregisterSnapshot(scan->xs_snapshot);
+ 
++	/* If prefetching enabled, log prefetch stats. */
++	if (scan->xs_prefetch)
++	{
++		IndexPrefetch prefetch = scan->xs_prefetch;
++
++		elog(LOG, "index prefetch stats: requests %lu prefetches %lu (%f) skip cached %lu sequential %lu",
++			 prefetch->countAll, prefetch->countPrefetch,
++			 prefetch->countPrefetch * 100.0 / prefetch->countAll,
++			 prefetch->countSkipCached, prefetch->countSkipSequential);
++	}
++
+ 	/* Release the scan data structure itself */
+ 	IndexScanEnd(scan);
+ }
+@@ -487,10 +552,13 @@ index_parallelrescan(IndexScanDesc scan)
+  * index_beginscan_parallel - join parallel index scan
+  *
+  * Caller must be holding suitable locks on the heap and the index.
++ *
++ * XXX See index_beginscan() for more comments on prefetch_target.
+  */
+ IndexScanDesc
+ index_beginscan_parallel(Relation heaprel, Relation indexrel, int nkeys,
+-						 int norderbys, ParallelIndexScanDesc pscan)
++						 int norderbys, ParallelIndexScanDesc pscan,
++						 int prefetch_target, int prefetch_reset)
+ {
+ 	Snapshot	snapshot;
+ 	IndexScanDesc scan;
+@@ -499,7 +567,7 @@ index_beginscan_parallel(Relation heaprel, Relation indexrel, int nkeys,
+ 	snapshot = RestoreSnapshot(pscan->ps_snapshot_data);
+ 	RegisterSnapshot(snapshot);
+ 	scan = index_beginscan_internal(indexrel, nkeys, norderbys, snapshot,
+-									pscan, true);
++									pscan, true, prefetch_target, prefetch_reset);
+ 
+ 	/*
+ 	 * Save additional parameters into the scandesc.  Everything else was set
+@@ -623,20 +691,74 @@ index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
+ bool
+ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
+ {
++	IndexPrefetch	prefetch = scan->xs_prefetch;
++
+ 	for (;;)
+ 	{
++		/* with prefetching enabled, accumulate enough TIDs into the prefetch */
++		if (PREFETCH_ACTIVE(prefetch))
++		{
++			/* 
++			 * incrementally ramp up prefetch distance
++			 *
++			 * XXX Intentionally done as first, so that with prefetching there's
++			 * always at least one item in the queue.
++			 */
++			prefetch->prefetchTarget = Min(prefetch->prefetchTarget + 1,
++										prefetch->prefetchMaxTarget);
++
++			/*
++			 * get more TID while there is empty space in the queue (considering
++			 * current prefetch target
++			 */
++			while (!PREFETCH_FULL(prefetch))
++			{
++				ItemPointer tid;
++
++				/* Time to fetch the next TID from the index */
++				tid = index_getnext_tid(scan, direction);
++
++				/* If we're out of index entries, we're done */
++				if (tid == NULL)
++				{
++					prefetch->prefetchDone = true;
++					break;
++				}
++
++				Assert(ItemPointerEquals(tid, &scan->xs_heaptid));
++
++				prefetch->queueItems[PREFETCH_QUEUE_INDEX(prefetch->queueEnd)] = *tid;
++				prefetch->queueEnd++;
++
++				index_prefetch(scan, tid);
++			}
++		}
++
+ 		if (!scan->xs_heap_continue)
+ 		{
+-			ItemPointer tid;
++			if (PREFETCH_ENABLED(prefetch))
++			{
++				/* prefetching enabled, but reached the end and queue empty */
++				if (PREFETCH_DONE(prefetch))
++					break;
++
++				scan->xs_heaptid = prefetch->queueItems[PREFETCH_QUEUE_INDEX(prefetch->queueIndex)];
++				prefetch->queueIndex++;
++			}
++			else	/* not prefetching, just do the regular work  */
++			{
++				ItemPointer tid;
+ 
+-			/* Time to fetch the next TID from the index */
+-			tid = index_getnext_tid(scan, direction);
++				/* Time to fetch the next TID from the index */
++				tid = index_getnext_tid(scan, direction);
+ 
+-			/* If we're out of index entries, we're done */
+-			if (tid == NULL)
+-				break;
++				/* If we're out of index entries, we're done */
++				if (tid == NULL)
++					break;
++
++				Assert(ItemPointerEquals(tid, &scan->xs_heaptid));
++			}
+ 
+-			Assert(ItemPointerEquals(tid, &scan->xs_heaptid));
+ 		}
+ 
+ 		/*
+@@ -988,3 +1110,258 @@ index_opclass_options(Relation indrel, AttrNumber attnum, Datum attoptions,
+ 
+ 	return build_local_reloptions(&relopts, attoptions, validate);
+ }
++
++/*
++ * Add the block to the tiny top-level queue (LRU), and check if the block
++ * is in a sequential pattern.
++ */
++static bool
++index_prefetch_is_sequential(IndexPrefetch prefetch, BlockNumber block)
++{
++	int		idx;
++
++	/* If the queue is empty, just store the block and we're done. */
++	if (prefetch->blockIndex == 0)
++	{
++		prefetch->blockItems[PREFETCH_BLOCK_INDEX(prefetch->blockIndex)] = block;
++		prefetch->blockIndex++;
++		return false;
++	}
++
++	/*
++	 * Otherwise, check if it's the same as the immediately preceding block (we
++	 * don't want to prefetch the same block over and over.)
++	 */
++	if (prefetch->blockItems[PREFETCH_BLOCK_INDEX(prefetch->blockIndex - 1)] == block)
++		return true;
++
++	/* Not the same block, so add it to the queue. */
++	prefetch->blockItems[PREFETCH_BLOCK_INDEX(prefetch->blockIndex)] = block;
++	prefetch->blockIndex++;
++
++	/* check sequential patter a couple requests back */
++	for (int i = 1; i < PREFETCH_SEQ_PATTERN_BLOCKS; i++)
++	{
++		/* not enough requests to confirm a sequential pattern */
++		if (prefetch->blockIndex < i)
++			return false;
++
++		/*
++		 * index of the already requested buffer (-1 because we already
++		 * incremented the index when adding the block to the queue)
++		 */
++		idx = PREFETCH_BLOCK_INDEX(prefetch->blockIndex - i - 1);
++
++		/*  */
++		if (prefetch->blockItems[idx] != (block - i))
++			return false;
++	}
++
++	return true;
++}
++
++/*
++ * index_prefetch_add_cache
++ *		Add a block to the cache, return true if it was recently prefetched.
++ *
++ * When checking a block, we need to check if it was recently prefetched,
++ * where recently means within PREFETCH_CACHE_SIZE requests. This check
++ * needs to be very cheap, even with fairly large caches (hundreds of
++ * entries). The cache does not need to be perfect, we can accept false
++ * positives/negatives, as long as the rate is reasonably low. We also
++ * need to expire entries, so that only "recent" requests are remembered.
++ *
++ * A queue would allow expiring the requests, but checking if a block was
++ * prefetched would be expensive (linear search for longer queues). Another
++ * option would be a hash table, but that has issues with expiring entries
++ * cheaply (which usually degrades the hash table).
++ *
++ * So we use a cache that is organized as multiple small LRU caches. Each
++ * block is mapped to a particular LRU by hashing (so it's a bit like a
++ * hash table), and each LRU is tiny (e.g. 8 entries). The LRU only keeps
++ * the most recent requests (for that particular LRU).
++ *
++ * This allows quick searches and expiration, with false negatives (when
++ * a particular LRU has too many collisions).
++ *
++ * For example, imagine 128 LRU caches, each with 8 entries - that's 1024
++ * prefetch request in total.
++ *
++ * The recency is determined using a prefetch counter, incremented every
++ * time we end up prefetching a block. The counter is uint64, so it should
++ * not wrap (125 zebibytes, would take ~4 million years at 1GB/s).
++ *
++ * To check if a block was prefetched recently, we calculate hash(block),
++ * and then linearly search if the tiny LRU has entry for the same block
++ * and request less than PREFETCH_CACHE_SIZE ago.
++ *
++ * At the same time, we either update the entry (for the same block) if
++ * found, or replace the oldest/empty entry.
++ *
++ * If the block was not recently prefetched (i.e. we want to prefetch it),
++ * we increment the counter.
++ */
++static bool
++index_prefetch_add_cache(IndexPrefetch prefetch, BlockNumber block)
++{
++	PrefetchCacheEntry *entry;
++
++	/* calculate which LRU to use */
++	int			lru = hash_uint32(block) % PREFETCH_LRU_COUNT;
++
++	/* entry to (maybe) use for this block request */
++	uint64		oldestRequest = PG_UINT64_MAX;
++	int			oldestIndex = -1;
++
++	/*
++	 * First add the block to the (tiny) top-level LRU cache and see if it's
++	 * part of a sequential pattern. In this case we just ignore the block
++	 * and don't prefetch it - we expect read-ahead to do a better job.
++	 *
++	 * XXX Maybe we should still add the block to the later cache, in case
++	 * we happen to access it later? That might help if we first scan a lot
++	 * of the table sequentially, and then randomly. Not sure that's very
++	 * likely with index access, though.
++	 */
++	if (index_prefetch_is_sequential(prefetch, block))
++	{
++		prefetch->countSkipSequential++;
++		return true;
++	}
++
++	/* see if we already have prefetched this block (linear search of LRU) */
++	for (int i = 0; i < PREFETCH_LRU_SIZE; i++)
++	{
++		entry = &prefetch->prefetchCache[lru * PREFETCH_LRU_SIZE + i];
++
++		/* Is this the oldest prefetch request in this LRU? */
++		if (entry->request < oldestRequest)
++		{
++			oldestRequest = entry->request;
++			oldestIndex = i;
++		}
++
++		/* Request numbers are positive, so 0 means "unused". */
++		if (entry->request == 0)
++			continue;
++
++		/* Is this entry for the same block as the current request? */
++		if (entry->block == block)
++		{
++			bool	prefetched;
++
++			/*
++			 * Is the old request sufficiently recent? If yes, we treat the
++			 * block as already prefetched.
++			 *
++			 * XXX We do add the cache size to the request in order not to
++			 * have issues with uint64 underflows.
++			 */
++			prefetched = (entry->request + PREFETCH_CACHE_SIZE >= prefetch->prefetchReqNumber);
++
++			/* Update the request number. */
++			entry->request = ++prefetch->prefetchReqNumber;
++
++			prefetch->countSkipCached += (prefetched) ? 1 : 0;
++
++			return prefetched;
++		}
++	}
++
++	/*
++	 * We didn't find the block in the LRU, so store it either in an empty
++	 * entry, or in the "oldest" prefetch request in this LRU.
++	 */
++	Assert((oldestIndex >= 0) && (oldestIndex < PREFETCH_LRU_SIZE));
++
++	entry = &prefetch->prefetchCache[lru * PREFETCH_LRU_SIZE + oldestIndex];
++
++	entry->block = block;
++	entry->request = ++prefetch->prefetchReqNumber;
++
++	/* not in the prefetch cache */
++	return false;
++}
++
++/*
++ * Do prefetching, and gradually increase the prefetch distance.
++ *
++ * XXX This is limited to a single index page (because that's where we get
++ * currPos.items from). But index tuples are typically very small, so there
++ * should be quite a bit of stuff to prefetch (especially with deduplicated
++ * indexes, etc.). Does not seem worth reworking the index access to allow
++ * more aggressive prefetching, it's best effort.
++ *
++ * XXX Some ideas how to auto-tune the prefetching, so that unnecessary
++ * prefetching does not cause significant regressions (e.g. for nestloop
++ * with inner index scan). We could track number of index pages visited
++ * and index tuples returned, to calculate avg tuples / page, and then
++ * use that to limit prefetching after switching to a new page (instead
++ * of just using prefetchMaxTarget, which can get much larger).
++ *
++ * XXX Obviously, another option is to use the planner estimates - we know
++ * how many rows we're expected to fetch (on average, assuming the estimates
++ * are reasonably accurate), so why not to use that. And maybe combine it
++ * with the auto-tuning based on runtime statistics, described above.
++ *
++ * XXX The prefetching may interfere with the patch allowing us to evaluate
++ * conditions on the index tuple, in which case we may not need the heap
++ * tuple. Maybe if there's such filter, we should prefetch only pages that
++ * are not all-visible (and the same idea would also work for IOS), but
++ * it also makes the indexing a bit "aware" of the visibility stuff (which
++ * seems a bit wrong). Also, maybe we should consider the filter selectivity
++ * (if the index-only filter is expected to eliminate only few rows, then
++ * the vm check is pointless). Maybe this could/should be auto-tuning too,
++ * i.e. we could track how many heap tuples were needed after all, and then
++ * we would consider this when deciding whether to prefetch all-visible
++ * pages or not (matters only for regular index scans, not IOS).
++ *
++ * XXX Maybe we could/should also prefetch the next index block, e.g. stored
++ * in BTScanPosData.nextPage.
++ */
++static void
++index_prefetch(IndexScanDesc scan, ItemPointer tid)
++{
++	IndexPrefetch	prefetch = scan->xs_prefetch;
++	BlockNumber	block;
++
++	/*
++	 * No heap relation means bitmap index scan, which does prefetching at
++	 * the bitmap heap scan, so no prefetch here (we can't do it anyway,
++	 * without the heap)
++	 *
++	 * XXX But in this case we should have prefetchMaxTarget=0, because in
++	 * index_bebinscan_bitmap() we disable prefetching. So maybe we should
++	 * just check that.
++	 */
++	if (!prefetch)
++		return;
++
++	/* was it initialized correctly? */
++	// Assert(prefetch->prefetchIndex != -1);
++
++	/*
++	 * If we got here, prefetching is enabled and it's a node that supports
++	 * prefetching (i.e. it can't be a bitmap index scan).
++	 */
++	Assert(scan->heapRelation);
++
++	prefetch->countAll++;
++
++	block = ItemPointerGetBlockNumber(tid);
++
++	/*
++	 * Do not prefetch the same block over and over again,
++	 *
++	 * This happens e.g. for clustered or naturally correlated indexes
++	 * (fkey to a sequence ID). It's not expensive (the block is in page
++	 * cache already, so no I/O), but it's not free either.
++	 */
++	if (!index_prefetch_add_cache(prefetch, block))
++	{
++		prefetch->countPrefetch++;
++
++		PrefetchBuffer(scan->heapRelation, MAIN_FORKNUM, block);
++		pgBufferUsage.blks_prefetches++;
++	}
++}
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 15f9bddcdf3..0e41ffa8fc0 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -3558,6 +3558,7 @@ show_buffer_usage(ExplainState *es, const BufferUsage *usage, bool planning)
+ 								  !INSTR_TIME_IS_ZERO(usage->blk_write_time));
+ 		bool		has_temp_timing = (!INSTR_TIME_IS_ZERO(usage->temp_blk_read_time) ||
+ 									   !INSTR_TIME_IS_ZERO(usage->temp_blk_write_time));
++		bool		has_prefetches = (usage->blks_prefetches > 0);
+ 		bool		show_planning = (planning && (has_shared ||
+ 												  has_local || has_temp || has_timing ||
+ 												  has_temp_timing));
+@@ -3655,6 +3656,23 @@ show_buffer_usage(ExplainState *es, const BufferUsage *usage, bool planning)
+ 			appendStringInfoChar(es->str, '\n');
+ 		}
+ 
++		/* As above, show only positive counter values. */
++		if (has_prefetches)
++		{
++			ExplainIndentText(es);
++			appendStringInfoString(es->str, "Prefetches:");
++
++			if (usage->blks_prefetches > 0)
++				appendStringInfo(es->str, " blocks=%lld",
++								 (long long) usage->blks_prefetches);
++
++			if (usage->blks_prefetch_rounds > 0)
++				appendStringInfo(es->str, " rounds=%lld",
++								 (long long) usage->blks_prefetch_rounds);
++
++			appendStringInfoChar(es->str, '\n');
++		}
++
+ 		if (show_planning)
+ 			es->indent--;
+ 	}
+diff --git a/src/backend/executor/execIndexing.c b/src/backend/executor/execIndexing.c
+index 1d82b64b897..e5ce1dbc953 100644
+--- a/src/backend/executor/execIndexing.c
++++ b/src/backend/executor/execIndexing.c
+@@ -765,11 +765,15 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
+ 	/*
+ 	 * May have to restart scan from this point if a potential conflict is
+ 	 * found.
++	 *
++	 * XXX Should this do index prefetch? Probably not worth it for unique
++	 * constraints, I guess? Otherwise we should calculate prefetch_target
++	 * just like in nodeIndexscan etc.
+ 	 */
+ retry:
+ 	conflict = false;
+ 	found_self = false;
+-	index_scan = index_beginscan(heap, index, &DirtySnapshot, indnkeyatts, 0);
++	index_scan = index_beginscan(heap, index, &DirtySnapshot, indnkeyatts, 0, 0, 0);
+ 	index_rescan(index_scan, scankeys, indnkeyatts, NULL, 0);
+ 
+ 	while (index_getnext_slot(index_scan, ForwardScanDirection, existing_slot))
+diff --git a/src/backend/executor/execReplication.c b/src/backend/executor/execReplication.c
+index 9dd71684615..a997aac828f 100644
+--- a/src/backend/executor/execReplication.c
++++ b/src/backend/executor/execReplication.c
+@@ -157,8 +157,13 @@ RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
+ 	/* Build scan key. */
+ 	skey_attoff = build_replindex_scan_key(skey, rel, idxrel, searchslot);
+ 
+-	/* Start an index scan. */
+-	scan = index_beginscan(rel, idxrel, &snap, skey_attoff, 0);
++	/* Start an index scan.
++	 *
++	 * XXX Should this do index prefetching? We're looking for a single tuple,
++	 * probably using a PK / UNIQUE index, so does not seem worth it. If we
++	 * reconsider this, calclate prefetch_target like in nodeIndexscan.
++	 */
++	scan = index_beginscan(rel, idxrel, &snap, skey_attoff, 0, 0, 0);
+ 
+ retry:
+ 	found = false;
+diff --git a/src/backend/executor/instrument.c b/src/backend/executor/instrument.c
+index ee78a5749d2..434be59fca0 100644
+--- a/src/backend/executor/instrument.c
++++ b/src/backend/executor/instrument.c
+@@ -235,6 +235,8 @@ BufferUsageAdd(BufferUsage *dst, const BufferUsage *add)
+ 	dst->local_blks_written += add->local_blks_written;
+ 	dst->temp_blks_read += add->temp_blks_read;
+ 	dst->temp_blks_written += add->temp_blks_written;
++	dst->blks_prefetch_rounds += add->blks_prefetch_rounds;
++	dst->blks_prefetches += add->blks_prefetches;
+ 	INSTR_TIME_ADD(dst->blk_read_time, add->blk_read_time);
+ 	INSTR_TIME_ADD(dst->blk_write_time, add->blk_write_time);
+ 	INSTR_TIME_ADD(dst->temp_blk_read_time, add->temp_blk_read_time);
+@@ -257,6 +259,8 @@ BufferUsageAccumDiff(BufferUsage *dst,
+ 	dst->local_blks_written += add->local_blks_written - sub->local_blks_written;
+ 	dst->temp_blks_read += add->temp_blks_read - sub->temp_blks_read;
+ 	dst->temp_blks_written += add->temp_blks_written - sub->temp_blks_written;
++	dst->blks_prefetches += add->blks_prefetches - sub->blks_prefetches;
++	dst->blks_prefetch_rounds += add->blks_prefetch_rounds - sub->blks_prefetch_rounds;
+ 	INSTR_TIME_ACCUM_DIFF(dst->blk_read_time,
+ 						  add->blk_read_time, sub->blk_read_time);
+ 	INSTR_TIME_ACCUM_DIFF(dst->blk_write_time,
+diff --git a/src/backend/executor/nodeIndexonlyscan.c b/src/backend/executor/nodeIndexonlyscan.c
+index 0b43a9b9699..3ecb8470d47 100644
+--- a/src/backend/executor/nodeIndexonlyscan.c
++++ b/src/backend/executor/nodeIndexonlyscan.c
+@@ -87,12 +87,20 @@ IndexOnlyNext(IndexOnlyScanState *node)
+ 		 * We reach here if the index only scan is not parallel, or if we're
+ 		 * serially executing an index only scan that was planned to be
+ 		 * parallel.
++		 *
++		 * XXX Maybe we should enable prefetching, but prefetch only pages that
++		 * are not all-visible (but checking that from the index code seems like
++		 * a violation of layering etc).
++		 *
++		 * XXX This might lead to IOS being slower than plain index scan, if the
++		 * table has a lot of pages that need recheck.
+ 		 */
+ 		scandesc = index_beginscan(node->ss.ss_currentRelation,
+ 								   node->ioss_RelationDesc,
+ 								   estate->es_snapshot,
+ 								   node->ioss_NumScanKeys,
+-								   node->ioss_NumOrderByKeys);
++								   node->ioss_NumOrderByKeys,
++								   0, 0);	/* no index prefetch for IOS */
+ 
+ 		node->ioss_ScanDesc = scandesc;
+ 
+@@ -674,7 +682,8 @@ ExecIndexOnlyScanInitializeDSM(IndexOnlyScanState *node,
+ 								 node->ioss_RelationDesc,
+ 								 node->ioss_NumScanKeys,
+ 								 node->ioss_NumOrderByKeys,
+-								 piscan);
++								 piscan,
++								 0, 0);	/* no index prefetch for IOS */
+ 	node->ioss_ScanDesc->xs_want_itup = true;
+ 	node->ioss_VMBuffer = InvalidBuffer;
+ 
+@@ -719,7 +728,8 @@ ExecIndexOnlyScanInitializeWorker(IndexOnlyScanState *node,
+ 								 node->ioss_RelationDesc,
+ 								 node->ioss_NumScanKeys,
+ 								 node->ioss_NumOrderByKeys,
+-								 piscan);
++								 piscan,
++								 0, 0);	/* no index prefetch for IOS */
+ 	node->ioss_ScanDesc->xs_want_itup = true;
+ 
+ 	/*
+diff --git a/src/backend/executor/nodeIndexscan.c b/src/backend/executor/nodeIndexscan.c
+index 4540c7781d2..71ae6a47ce5 100644
+--- a/src/backend/executor/nodeIndexscan.c
++++ b/src/backend/executor/nodeIndexscan.c
+@@ -43,6 +43,7 @@
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+ #include "utils/rel.h"
++#include "utils/spccache.h"
+ 
+ /*
+  * When an ordering operator is used, tuples fetched from the index that
+@@ -85,6 +86,7 @@ IndexNext(IndexScanState *node)
+ 	ScanDirection direction;
+ 	IndexScanDesc scandesc;
+ 	TupleTableSlot *slot;
++	Relation heapRel = node->ss.ss_currentRelation;
+ 
+ 	/*
+ 	 * extract necessary information from index scan node
+@@ -103,6 +105,22 @@ IndexNext(IndexScanState *node)
+ 
+ 	if (scandesc == NULL)
+ 	{
++		int	prefetch_target;
++		int	prefetch_reset;
++
++		/*
++		 * Determine number of heap pages to prefetch for this index. This is
++		 * essentially just effective_io_concurrency for the table (or the
++		 * tablespace it's in).
++		 *
++		 * XXX Should this also look at plan.plan_rows and maybe cap the target
++		 * to that? Pointless to prefetch more than we expect to use. Or maybe
++		 * just reset to that value during prefetching, after reading the next
++		 * index page (or rather after rescan)?
++		 */
++		prefetch_target = get_tablespace_io_concurrency(heapRel->rd_rel->reltablespace);
++		prefetch_reset = Min(prefetch_target, node->ss.ps.plan->plan_rows);
++
+ 		/*
+ 		 * We reach here if the index scan is not parallel, or if we're
+ 		 * serially executing an index scan that was planned to be parallel.
+@@ -111,7 +129,9 @@ IndexNext(IndexScanState *node)
+ 								   node->iss_RelationDesc,
+ 								   estate->es_snapshot,
+ 								   node->iss_NumScanKeys,
+-								   node->iss_NumOrderByKeys);
++								   node->iss_NumOrderByKeys,
++								   prefetch_target,
++								   prefetch_reset);
+ 
+ 		node->iss_ScanDesc = scandesc;
+ 
+@@ -198,6 +218,23 @@ IndexNextWithReorder(IndexScanState *node)
+ 
+ 	if (scandesc == NULL)
+ 	{
++		Relation heapRel = node->ss.ss_currentRelation;
++		int	prefetch_target;
++		int	prefetch_reset;
++
++		/*
++		 * Determine number of heap pages to prefetch for this index. This is
++		 * essentially just effective_io_concurrency for the table (or the
++		 * tablespace it's in).
++		 *
++		 * XXX Should this also look at plan.plan_rows and maybe cap the target
++		 * to that? Pointless to prefetch more than we expect to use. Or maybe
++		 * just reset to that value during prefetching, after reading the next
++		 * index page (or rather after rescan)?
++		 */
++		prefetch_target = get_tablespace_io_concurrency(heapRel->rd_rel->reltablespace);
++		prefetch_reset = Min(prefetch_target, node->ss.ps.plan->plan_rows);
++
+ 		/*
+ 		 * We reach here if the index scan is not parallel, or if we're
+ 		 * serially executing an index scan that was planned to be parallel.
+@@ -206,7 +243,9 @@ IndexNextWithReorder(IndexScanState *node)
+ 								   node->iss_RelationDesc,
+ 								   estate->es_snapshot,
+ 								   node->iss_NumScanKeys,
+-								   node->iss_NumOrderByKeys);
++								   node->iss_NumOrderByKeys,
++								   prefetch_target,
++								   prefetch_reset);
+ 
+ 		node->iss_ScanDesc = scandesc;
+ 
+@@ -1678,6 +1717,21 @@ ExecIndexScanInitializeDSM(IndexScanState *node,
+ {
+ 	EState	   *estate = node->ss.ps.state;
+ 	ParallelIndexScanDesc piscan;
++	Relation	heapRel;
++	int			prefetch_target;
++	int			prefetch_reset;
++
++	/*
++	 * Determine number of heap pages to prefetch for this index. This is
++	 * essentially just effective_io_concurrency for the table (or the
++	 * tablespace it's in).
++	 *
++	 * XXX Maybe reduce the value with parallel workers?
++	 */
++	heapRel = node->ss.ss_currentRelation;
++
++	prefetch_target = get_tablespace_io_concurrency(heapRel->rd_rel->reltablespace);
++	prefetch_reset = Min(prefetch_target, node->ss.ps.plan->plan_rows);
+ 
+ 	piscan = shm_toc_allocate(pcxt->toc, node->iss_PscanLen);
+ 	index_parallelscan_initialize(node->ss.ss_currentRelation,
+@@ -1690,7 +1744,9 @@ ExecIndexScanInitializeDSM(IndexScanState *node,
+ 								 node->iss_RelationDesc,
+ 								 node->iss_NumScanKeys,
+ 								 node->iss_NumOrderByKeys,
+-								 piscan);
++								 piscan,
++								 prefetch_target,
++								 prefetch_reset);
+ 
+ 	/*
+ 	 * If no run-time keys to calculate or they are ready, go ahead and pass
+@@ -1726,6 +1782,14 @@ ExecIndexScanInitializeWorker(IndexScanState *node,
+ 							  ParallelWorkerContext *pwcxt)
+ {
+ 	ParallelIndexScanDesc piscan;
++	Relation	heapRel;
++	int			prefetch_target;
++	int			prefetch_reset;
++
++	heapRel = node->ss.ss_currentRelation;
++
++	prefetch_target = get_tablespace_io_concurrency(heapRel->rd_rel->reltablespace);
++	prefetch_reset = Min(prefetch_target, node->ss.ps.plan->plan_rows);
+ 
+ 	piscan = shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, false);
+ 	node->iss_ScanDesc =
+@@ -1733,7 +1797,9 @@ ExecIndexScanInitializeWorker(IndexScanState *node,
+ 								 node->iss_RelationDesc,
+ 								 node->iss_NumScanKeys,
+ 								 node->iss_NumOrderByKeys,
+-								 piscan);
++								 piscan,
++								 prefetch_target,
++								 prefetch_reset);
+ 
+ 	/*
+ 	 * If no run-time keys to calculate or they are ready, go ahead and pass
+diff --git a/src/backend/replication/walsender.c b/src/backend/replication/walsender.c
+index d3a136b6f55..c7248877f6c 100644
+--- a/src/backend/replication/walsender.c
++++ b/src/backend/replication/walsender.c
+@@ -1131,6 +1131,8 @@ CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
+ 			need_full_snapshot = true;
+ 		}
+ 
++		elog(LOG, "slot = %s  need_full_snapshot = %d", cmd->slotname, need_full_snapshot);
++
+ 		ctx = CreateInitDecodingContext(cmd->plugin, NIL, need_full_snapshot,
+ 										InvalidXLogRecPtr,
+ 										XL_ROUTINE(.page_read = logical_read_xlog_page,
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index c4fcd0076ea..0b02b6265d0 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -6218,7 +6218,7 @@ get_actual_variable_endpoint(Relation heapRel,
+ 
+ 	index_scan = index_beginscan(heapRel, indexRel,
+ 								 &SnapshotNonVacuumable,
+-								 1, 0);
++								 1, 0, 0, 0);	/* XXX maybe do prefetch? */
+ 	/* Set it up for index-only scan */
+ 	index_scan->xs_want_itup = true;
+ 	index_rescan(index_scan, scankeys, 1, NULL, 0);
+diff --git a/src/include/access/genam.h b/src/include/access/genam.h
+index a3087956654..f3efffc4a84 100644
+--- a/src/include/access/genam.h
++++ b/src/include/access/genam.h
+@@ -17,6 +17,7 @@
+ #include "access/sdir.h"
+ #include "access/skey.h"
+ #include "nodes/tidbitmap.h"
++#include "storage/bufmgr.h"
+ #include "storage/lockdefs.h"
+ #include "utils/relcache.h"
+ #include "utils/snapshot.h"
+@@ -152,7 +153,9 @@ extern bool index_insert(Relation indexRelation,
+ extern IndexScanDesc index_beginscan(Relation heapRelation,
+ 									 Relation indexRelation,
+ 									 Snapshot snapshot,
+-									 int nkeys, int norderbys);
++									 int nkeys, int norderbys,
++									 int prefetch_target,
++									 int prefetch_reset);
+ extern IndexScanDesc index_beginscan_bitmap(Relation indexRelation,
+ 											Snapshot snapshot,
+ 											int nkeys);
+@@ -169,7 +172,9 @@ extern void index_parallelscan_initialize(Relation heapRelation,
+ extern void index_parallelrescan(IndexScanDesc scan);
+ extern IndexScanDesc index_beginscan_parallel(Relation heaprel,
+ 											  Relation indexrel, int nkeys, int norderbys,
+-											  ParallelIndexScanDesc pscan);
++											  ParallelIndexScanDesc pscan,
++											  int prefetch_target,
++											  int prefetch_reset);
+ extern ItemPointer index_getnext_tid(IndexScanDesc scan,
+ 									 ScanDirection direction);
+ struct TupleTableSlot;
+@@ -230,4 +235,108 @@ extern HeapTuple systable_getnext_ordered(SysScanDesc sysscan,
+ 										  ScanDirection direction);
+ extern void systable_endscan_ordered(SysScanDesc sysscan);
+ 
++/*
++ * XXX not sure it's the right place to define these callbacks etc.
++ */
++typedef void (*prefetcher_getrange_function) (IndexScanDesc scandesc,
++											  ScanDirection direction,
++											  int *start, int *end,
++											  bool *reset);
++
++typedef BlockNumber (*prefetcher_getblock_function) (IndexScanDesc scandesc,
++													 ScanDirection direction,
++													 int index);
++
++/*
++ * Cache of recently prefetched blocks, organized as a hash table of
++ * small LRU caches. Doesn't need to be perfectly accurate, but we
++ * aim to make false positives/negatives reasonably low.
++ */
++typedef struct PrefetchCacheEntry {
++	BlockNumber		block;
++	uint64			request;
++} PrefetchCacheEntry;
++
++/*
++ * Size of the cache of recently prefetched blocks - shouldn't be too
++ * small or too large. 1024 seems about right, it covers ~8MB of data.
++ * It's somewhat arbitrary, there's no particular formula saying it
++ * should not be higher/lower.
++ *
++ * The cache is structured as an array of small LRU caches, so the total
++ * size needs to be a multiple of LRU size. The LRU should be tiny to
++ * keep linear search cheap enough.
++ *
++ * XXX Maybe we could consider effective_cache_size or something?
++ */
++#define		PREFETCH_LRU_SIZE		8
++#define		PREFETCH_LRU_COUNT		128
++#define		PREFETCH_CACHE_SIZE		(PREFETCH_LRU_SIZE * PREFETCH_LRU_COUNT)
++
++/*
++ * Used to detect sequential patterns (and disable prefetching).
++ */
++#define		PREFETCH_QUEUE_HISTORY			8
++#define		PREFETCH_SEQ_PATTERN_BLOCKS		4
++
++
++typedef struct IndexPrefetchData
++{
++	/*
++	 * XXX We need to disable this in some cases (e.g. when using index-only
++	 * scans, we don't want to prefetch pages). Or maybe we should prefetch
++	 * only pages that are not all-visible, that'd be even better.
++	 */
++	int			prefetchTarget;	/* how far we should be prefetching */
++	int			prefetchMaxTarget;	/* maximum prefetching distance */
++	int			prefetchReset;	/* reset to this distance on rescan */
++	bool		prefetchDone;	/* did we get all TIDs from the index? */
++
++	/* runtime statistics */
++	uint64		countAll;		/* all prefetch requests */
++	uint64		countPrefetch;	/* actual prefetches */
++	uint64		countSkipSequential;
++	uint64		countSkipCached;
++
++	/*
++	 * Queue of TIDs to prefetch.
++	 *
++	 * XXX Sizing for MAX_IO_CONCURRENCY may be overkill, but it seems simpler
++	 * than dynamically adjusting for custom values.
++	 */
++	ItemPointerData	queueItems[MAX_IO_CONCURRENCY];
++	uint64			queueIndex;	/* next TID to prefetch */
++	uint64			queueStart;	/* first valid TID in queue */
++	uint64			queueEnd;	/* first invalid (empty) TID in queue */
++
++	/*
++	 * A couple of last prefetched blocks, used to check for certain access
++	 * pattern and skip prefetching - e.g. for sequential access).
++	 *
++	 * XXX Separate from the main queue, because we only want to compare the
++	 * block numbers, not the whole TID. In sequential access it's likely we
++	 * read many items from each page, and we don't want to check many items
++	 * (as that is much more expensive).
++	 */
++	BlockNumber		blockItems[PREFETCH_QUEUE_HISTORY];
++	uint64			blockIndex;	/* index in the block (points to the first
++								 * empty entry)*/
++
++	/*
++	 * Cache of recently prefetched blocks, organized as a hash table of
++	 * small LRU caches.
++	 */
++	uint64				prefetchReqNumber;
++	PrefetchCacheEntry	prefetchCache[PREFETCH_CACHE_SIZE];
++
++} IndexPrefetchData;
++
++#define PREFETCH_QUEUE_INDEX(a)	((a) % (MAX_IO_CONCURRENCY))
++#define PREFETCH_QUEUE_EMPTY(p)	((p)->queueEnd == (p)->queueIndex)
++#define PREFETCH_ENABLED(p)		((p) && ((p)->prefetchMaxTarget > 0))
++#define PREFETCH_FULL(p)		((p)->queueEnd - (p)->queueIndex == (p)->prefetchTarget)
++#define PREFETCH_DONE(p)		((p) && ((p)->prefetchDone && PREFETCH_QUEUE_EMPTY(p)))
++#define PREFETCH_ACTIVE(p)		(PREFETCH_ENABLED(p) && !(p)->prefetchDone)
++#define PREFETCH_BLOCK_INDEX(v)	((v) % PREFETCH_QUEUE_HISTORY)
++
+ #endif							/* GENAM_H */
+diff --git a/src/include/access/relscan.h b/src/include/access/relscan.h
+index d03360eac04..c119fe597d8 100644
+--- a/src/include/access/relscan.h
++++ b/src/include/access/relscan.h
+@@ -106,6 +106,12 @@ typedef struct IndexFetchTableData
+ 	Relation	rel;
+ } IndexFetchTableData;
+ 
++/*
++ * Forward declaration, defined in genam.h.
++ */
++typedef struct IndexPrefetchData IndexPrefetchData;
++typedef struct IndexPrefetchData *IndexPrefetch;
++
+ /*
+  * We use the same IndexScanDescData structure for both amgettuple-based
+  * and amgetbitmap-based index scans.  Some fields are only relevant in
+@@ -162,6 +168,9 @@ typedef struct IndexScanDescData
+ 	bool	   *xs_orderbynulls;
+ 	bool		xs_recheckorderby;
+ 
++	/* prefetching state (or NULL if disabled) */
++	IndexPrefetchData *xs_prefetch;
++
+ 	/* parallel index scan information, in shared memory */
+ 	struct ParallelIndexScanDescData *parallel_scan;
+ }			IndexScanDescData;
+diff --git a/src/include/executor/instrument.h b/src/include/executor/instrument.h
+index 87e5e2183bd..97dd3c2c421 100644
+--- a/src/include/executor/instrument.h
++++ b/src/include/executor/instrument.h
+@@ -33,6 +33,8 @@ typedef struct BufferUsage
+ 	int64		local_blks_written; /* # of local disk blocks written */
+ 	int64		temp_blks_read; /* # of temp blocks read */
+ 	int64		temp_blks_written;	/* # of temp blocks written */
++	int64		blks_prefetch_rounds;	/* # of prefetch rounds */
++	int64		blks_prefetches;	/* # of buffers prefetched */
+ 	instr_time	blk_read_time;	/* time spent reading blocks */
+ 	instr_time	blk_write_time; /* time spent writing blocks */
+ 	instr_time	temp_blk_read_time; /* time spent reading temp blocks */
