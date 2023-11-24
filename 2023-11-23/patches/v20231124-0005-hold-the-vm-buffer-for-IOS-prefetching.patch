@@ -1,0 +1,79 @@
+From 23eead34921a16b8301160ce8bde51be615856f0 Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Wed, 22 Nov 2023 23:26:08 +0100
+Subject: [PATCH v20231124 5/7] hold the vm buffer for IOS prefetching
+
+---
+ src/backend/access/index/indexam.c       |  7 ++-----
+ src/backend/executor/nodeIndexonlyscan.c | 12 ++++++++++++
+ src/include/access/genam.h               |  3 +++
+ 3 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/access/index/indexam.c b/src/backend/access/index/indexam.c
+index 7456a69ab34..53948986ada 100644
+--- a/src/backend/access/index/indexam.c
++++ b/src/backend/access/index/indexam.c
+@@ -336,6 +336,7 @@ index_beginscan_internal(Relation indexRelation,
+ 
+ 		prefetcher->prefetchTarget = 0;
+ 		prefetcher->prefetchMaxTarget = prefetch_max;
++		prefetcher->vmBuffer = InvalidBuffer;
+ 
+ 		scan->xs_prefetch = prefetcher;
+ 	}
+@@ -1278,14 +1279,10 @@ index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible)
+ 	if (skip_all_visible)
+ 	{
+ 		bool	all_visible;
+-		Buffer	vmbuffer = InvalidBuffer;
+ 
+ 		all_visible = VM_ALL_VISIBLE(scan->heapRelation,
+ 									 block,
+-									 &vmbuffer);
+-
+-		if (vmbuffer != InvalidBuffer)
+-			ReleaseBuffer(vmbuffer);
++									 &prefetch->vmBuffer);
+ 
+ 		if (all_visible)
+ 			return;
+diff --git a/src/backend/executor/nodeIndexonlyscan.c b/src/backend/executor/nodeIndexonlyscan.c
+index 545046e98ad..60cb772344f 100644
+--- a/src/backend/executor/nodeIndexonlyscan.c
++++ b/src/backend/executor/nodeIndexonlyscan.c
+@@ -412,6 +412,18 @@ ExecEndIndexOnlyScan(IndexOnlyScanState *node)
+ 		node->ioss_VMBuffer = InvalidBuffer;
+ 	}
+ 
++	/* Release VM buffer pin from prefetcher, if any. */
++	if (indexScanDesc && indexScanDesc->xs_prefetch)
++	{
++		IndexPrefetch indexPrefetch = indexScanDesc->xs_prefetch;
++
++		if (indexPrefetch->vmBuffer != InvalidBuffer)
++		{
++			ReleaseBuffer(indexPrefetch->vmBuffer);
++			indexPrefetch->vmBuffer = InvalidBuffer;
++		}
++	}
++
+ 	/*
+ 	 * close the index relation (no-op if we didn't open it)
+ 	 */
+diff --git a/src/include/access/genam.h b/src/include/access/genam.h
+index 9e2d77ef23b..8a3be673730 100644
+--- a/src/include/access/genam.h
++++ b/src/include/access/genam.h
+@@ -270,6 +270,9 @@ typedef struct IndexPrefetchData
+ 	uint64		countSkipSequential;
+ 	uint64		countSkipCached;
+ 
++	/* used when prefetching index-only scans */
++	Buffer		vmBuffer;
++
+ 	/*
+ 	 * Queue of TIDs to prefetch.
+ 	 *
+-- 
+2.42.0
+

@@ -1,0 +1,509 @@
+From 3ba126559c69a31f6f0c48c85de2c892cebac4f3 Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Fri, 24 Nov 2023 12:31:43 +0100
+Subject: [PATCH v20231124 7/7] 20231016-reworked
+
+---
+ src/backend/access/index/indexam.c  | 195 ++++++++++++++++++++++++----
+ src/backend/storage/buffer/bufmgr.c |  12 --
+ src/backend/storage/file/fd.c       |  40 ------
+ src/backend/storage/smgr/md.c       |  27 ----
+ src/backend/storage/smgr/smgr.c     |  19 ---
+ src/include/access/genam.h          |  25 +++-
+ src/include/storage/fd.h            |   1 -
+ src/include/storage/md.h            |   2 -
+ src/include/storage/smgr.h          |   2 -
+ 9 files changed, 195 insertions(+), 128 deletions(-)
+
+diff --git a/src/backend/access/index/indexam.c b/src/backend/access/index/indexam.c
+index 45c97aff5ef..82e3266bcc0 100644
+--- a/src/backend/access/index/indexam.c
++++ b/src/backend/access/index/indexam.c
+@@ -1203,6 +1203,148 @@ index_prefetch_is_sequential(IndexPrefetch prefetch, BlockNumber block)
+ 	return true;
+ }
+ 
++/*
++ * index_prefetch_add_cache
++ *		Add a block to the cache, check if it was recently prefetched.
++ *
++ * We don't want to prefetch blocks that we already prefetched recently. It's
++ * cheap but not free, and the overhead may have measurable impact.
++ *
++ * This check needs to be very cheap, even with fairly large caches (hundreds
++ * of entries, see PREFETCH_CACHE_SIZE).
++ *
++ * A simple queue would allow expiring the requests, but checking if it
++ * contains a particular block prefetched would be expensive (linear search).
++ * Another option would be a simple hash table, which has fast lookup but
++ * does not allow expiring entries cheaply.
++ *
++ * The cache does not need to be perfect, we can accept false
++ * positives/negatives, as long as the rate is reasonably low. We also need
++ * to expire entries, so that only "recent" requests are remembered.
++ *
++ * We use a hybrid cache that is organized as many small LRU caches. Each
++ * block is mapped to a particular LRU by hashing (so it's a bit like a
++ * hash table). The LRU caches are tiny (e.g. 8 entries), and the expiration
++ * happens at the level of a single LRU (by tracking only the 8 most recent requests).
++ *
++ * This allows quick searches and expiration, but with false negatives (when a
++ * particular LRU has too many collisions, we may evict entries that are more
++ * recent than some other LRU).
++ *
++ * For example, imagine 128 LRU caches, each with 8 entries - that's 1024
++ * prefetch request in total (these are the default parameters.)
++ *
++ * The recency is determined using a prefetch counter, incremented every
++ * time we end up prefetching a block. The counter is uint64, so it should
++ * not wrap (125 zebibytes, would take ~4 million years at 1GB/s).
++ *
++ * To check if a block was prefetched recently, we calculate hash(block),
++ * and then linearly search if the tiny LRU has entry for the same block
++ * and request less than PREFETCH_CACHE_SIZE ago.
++ *
++ * At the same time, we either update the entry (for the queried block) if
++ * found, or replace the oldest/empty entry.
++ *
++ * If the block was not recently prefetched (i.e. we want to prefetch it),
++ * we increment the counter.
++ *
++ * Returns true if the block was recently prefetched (and thus we don't
++ * need to prefetch it again), or false (should do a prefetch).
++ *
++ * XXX It's a bit confusing these return values are inverse compared to
++ * what index_prefetch_is_sequential does.
++ */
++static bool
++index_prefetch_add_cache(IndexPrefetch prefetch, BlockNumber block)
++{
++	PrefetchCacheEntry *entry;
++
++	/* map the block number the the LRU */
++	int			lru = hash_uint32(block) % PREFETCH_LRU_COUNT;
++
++	/* age/index of the oldest entry in the LRU, to maybe use */
++	uint64		oldestRequest = PG_UINT64_MAX;
++	int			oldestIndex = -1;
++
++	/*
++	 * First add the block to the (tiny) top-level LRU cache and see if it's
++	 * part of a sequential pattern. In this case we just ignore the block and
++	 * don't prefetch it - we expect read-ahead to do a better job.
++	 *
++	 * XXX Maybe we should still add the block to the hybrid cache, in case we
++	 * happen to access it later? That might help if we first scan a lot of
++	 * the table sequentially, and then randomly. Not sure that's very likely
++	 * with index access, though.
++	 */
++	if (index_prefetch_is_sequential(prefetch, block))
++	{
++		prefetch->countSkipSequential++;
++		return true;
++	}
++
++	/*
++	 * See if we recently prefetched this block - we simply scan the LRU
++	 * linearly. While doing that, we also track the oldest entry, so that we
++	 * know where to put the block if we don't find a matching entry.
++	 */
++	for (int i = 0; i < PREFETCH_LRU_SIZE; i++)
++	{
++		entry = &prefetch->prefetchCache[lru * PREFETCH_LRU_SIZE + i];
++
++		/* Is this the oldest prefetch request in this LRU? */
++		if (entry->request < oldestRequest)
++		{
++			oldestRequest = entry->request;
++			oldestIndex = i;
++		}
++
++		/*
++		 * If the entry is unused (identified by request being set to 0),
++		 * we're done. Notice the field is uint64, so empty entry is
++		 * guaranteed to be the oldest one.
++		 */
++		if (entry->request == 0)
++			continue;
++
++		/* Is this entry for the same block as the current request? */
++		if (entry->block == block)
++		{
++			bool		prefetched;
++
++			/*
++			 * Is the old request sufficiently recent? If yes, we treat the
++			 * block as already prefetched.
++			 *
++			 * XXX We do add the cache size to the request in order not to
++			 * have issues with uint64 underflows.
++			 */
++			prefetched = ((entry->request + PREFETCH_CACHE_SIZE) >= prefetch->prefetchReqNumber);
++
++			/* Update the request number. */
++			entry->request = ++prefetch->prefetchReqNumber;
++
++			prefetch->countSkipCached += (prefetched) ? 1 : 0;
++
++			return prefetched;
++		}
++	}
++
++	/*
++	 * We didn't find the block in the LRU, so store it either in an empty
++	 * entry, or in the "oldest" prefetch request in this LRU.
++	 */
++	Assert((oldestIndex >= 0) && (oldestIndex < PREFETCH_LRU_SIZE));
++
++	/* FIXME do a nice macro */
++	entry = &prefetch->prefetchCache[lru * PREFETCH_LRU_SIZE + oldestIndex];
++
++	entry->block = block;
++	entry->request = ++prefetch->prefetchReqNumber;
++
++	/* not in the prefetch cache */
++	return false;
++}
++
+ /*
+  * index_prefetch
+  *		Prefetch the TID, unless it's sequential or recently prefetched.
+@@ -1237,13 +1379,35 @@ index_prefetch_is_sequential(IndexPrefetch prefetch, BlockNumber block)
+  *
+  * XXX Maybe we could/should also prefetch the next index block, e.g. stored
+  * in BTScanPosData.nextPage.
++ *
++ * XXX Could we tune the cache size based on execution statistics? We have
++ * a cache of limited size (PREFETCH_CACHE_SIZE = 1024 by default), but
++ * how do we know it's the right size? Ideally, we'd have a cache large
++ * enough to track actually cached blocks. If the OS caches 10240 pages,
++ * then we may do 90% of prefetch requests unnecessarily. Or maybe there's
++ * a lot of contention, blocks are evicted quickly, and 90% of the blocks
++ * in the cache are not actually cached anymore? But we do have a concept
++ * of sequential request ID (PrefetchCacheEntry->request), which gives us
++ * information about "age" of the last prefetch. Now it's used only when
++ * evicting entries (to keep the more recent one), but maybe we could also
++ * use it when deciding if the page is cached. Right now any block that's
++ * in the cache is considered cached and not prefetched, but maybe we could
++ * have "max age", and tune it based on feedback from reading the blocks
++ * later. For example, if we find the block in cache and decide not to
++ * prefetch it, but then later find we have to do I/O, it means our cache
++ * is too large. And we could "reduce" the maximum age (measured from the
++ * current prefetchReqNumber value), so that only more recent blocks would
++ * be considered cached. Not sure about the opposite direction, where we
++ * decide to prefetch a block - AFAIK we don't have a way to determine if
++ * I/O was needed or not in this case (so we can't increase the max age).
++ * But maybe we could di that somehow speculatively, i.e. increase the
++ * value once in a while, and see what happens.
+  */
+ static void
+ index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible, bool *all_visible)
+ {
+ 	IndexPrefetch prefetch = scan->xs_prefetch;
+ 	BlockNumber block;
+-	PrefetchBufferResult result;
+ 
+ 	/* by default not all visible (or we didn't check) */
+ 	*all_visible = false;
+@@ -1295,28 +1459,6 @@ index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible, bool
+ 			return;
+ 	}
+ 
+-	/*
+-	 * Now also check if the blocks to prefetch are in a sequential pattern.
+-	 * We do it here because we need to do this check before PrefetchBuffer
+-	 * initiates the prefetch, and we it can't do this easily (as it doesn't
+-	 * know in what context it's called in). So we do it here.
+-	 *
+-	 * We use a tiny LRU cache and see if the blocks follow a sequential
+-	 * pattern - if it's the same as the previous block, or if the last
+-	 * couple blocks are a continguous sequence, we don't prefetch it.
+-	 */
+-	if (index_prefetch_is_sequential(prefetch, block))
+-	{
+-		prefetch->countSkipSequential++;
+-		return;
+-	}
+-
+-	/* XXX shouldn't this be before the VM / sequenqial check? */
+-	prefetch->countAll++;
+-
+-	/* OK, try prefetching the block. */
+-	result = PrefetchBuffer(scan->heapRelation, MAIN_FORKNUM, block);
+-
+ 	/*
+ 	 * Do not prefetch the same block over and over again,
+ 	 *
+@@ -1324,11 +1466,15 @@ index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible, bool
+ 	 * to a sequence ID). It's not expensive (the block is in page cache
+ 	 * already, so no I/O), but it's not free either.
+ 	 */
+-	if (result.initiated_io)
++	if (!index_prefetch_add_cache(prefetch, block))
+ 	{
+ 		prefetch->countPrefetch++;
++
++		PrefetchBuffer(scan->heapRelation, MAIN_FORKNUM, block);
+ 		pgBufferUsage.blks_prefetches++;
+ 	}
++
++	prefetch->countAll++;
+ }
+ 
+ /* ----------------
+@@ -1462,5 +1608,6 @@ index_prefetch_get_tid(IndexScanDesc scan, ScanDirection direction, bool *all_vi
+ 		Assert(ItemPointerEquals(tid, &scan->xs_heaptid));
+ 	}
+ 
++	/* Return the TID of the tuple we found. */
+ 	return &scan->xs_heaptid;
+ }
+diff --git a/src/backend/storage/buffer/bufmgr.c b/src/backend/storage/buffer/bufmgr.c
+index 74da9c1376b..f7c67d504cd 100644
+--- a/src/backend/storage/buffer/bufmgr.c
++++ b/src/backend/storage/buffer/bufmgr.c
+@@ -567,20 +567,8 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
+ 		/*
+ 		 * Try to initiate an asynchronous read.  This returns false in
+ 		 * recovery if the relation file doesn't exist.
+-		 *
+-		 * But first check if the block is already present in page cache.
+-		 *
+-		 * FIXME This breaks prefetch from recovery. Apparently that expects
+-		 * the prefetch to initiate the I/O, otherwise it fails with. But
+-		 * XLogPrefetcherNextBlock checks initiated_io, and may fail with:
+-		 *
+-		 * FATAL:  could not prefetch relation 1663/16384/16401 block 83758
+-		 *
+-		 * So maybe just fake the initiated_io=true in this case? Or not do
+-		 * this when in recovery.
+ 		 */
+ 		if ((io_direct_flags & IO_DIRECT_DATA) == 0 &&
+-			!smgrcached(smgr_reln, forkNum, blockNum) &&
+ 			smgrprefetch(smgr_reln, forkNum, blockNum))
+ 		{
+ 			result.initiated_io = true;
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index 2c51a3376f3..f691ba09321 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -78,7 +78,6 @@
+ #include <sys/resource.h>		/* for getrlimit */
+ #include <sys/stat.h>
+ #include <sys/types.h>
+-#include <sys/uio.h>
+ #ifndef WIN32
+ #include <sys/mman.h>
+ #endif
+@@ -2084,45 +2083,6 @@ retry:
+ #endif
+ }
+ 
+-/*
+- * FileCached - check if a given range of the file is in page cache.
+- *
+- * XXX relies on preadv2, probably needs to be checked by configure
+- */
+-bool
+-FileCached(File file, off_t offset, off_t amount, uint32 wait_event_info)
+-{
+-#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_WILLNEED)
+-	int			returnCode;
+-	size_t		readlen;
+-	char		buffer[BLCKSZ];
+-	struct iovec	iov[1];
+-
+-	Assert(FileIsValid(file));
+-
+-	DO_DB(elog(LOG, "FilePrefetch: %d (%s) " INT64_FORMAT " " INT64_FORMAT,
+-			   file, VfdCache[file].fileName,
+-			   (int64) offset, (int64) amount));
+-
+-	returnCode = FileAccess(file);
+-	if (returnCode < 0)
+-		return false;
+-
+-	/* XXX not sure if this ensures proper buffer alignment */
+-	iov[0].iov_base = &buffer;
+-	iov[0].iov_len = amount;
+-
+-	pgstat_report_wait_start(wait_event_info);
+-	readlen = preadv2(VfdCache[file].fd, iov, 1, offset, RWF_NOWAIT);
+-	pgstat_report_wait_end();
+-
+-	return (readlen == amount);
+-#else
+-	Assert(FileIsValid(file));
+-	return false;
+-#endif
+-}
+-
+ void
+ FileWriteback(File file, off_t offset, off_t nbytes, uint32 wait_event_info)
+ {
+diff --git a/src/backend/storage/smgr/md.c b/src/backend/storage/smgr/md.c
+index 16a7c424683..fdecbad1709 100644
+--- a/src/backend/storage/smgr/md.c
++++ b/src/backend/storage/smgr/md.c
+@@ -736,33 +736,6 @@ mdprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+ 	return true;
+ }
+ 
+-/*
+- * mdcached() -- Check if the whole block is already available in page cache.
+- */
+-bool
+-mdcached(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+-{
+-#ifdef USE_PREFETCH
+-	off_t		seekpos;
+-	MdfdVec    *v;
+-
+-	Assert((io_direct_flags & IO_DIRECT_DATA) == 0);
+-
+-	v = _mdfd_getseg(reln, forknum, blocknum, false,
+-					 InRecovery ? EXTENSION_RETURN_NULL : EXTENSION_FAIL);
+-	if (v == NULL)
+-		return false;
+-
+-	seekpos = (off_t) BLCKSZ * (blocknum % ((BlockNumber) RELSEG_SIZE));
+-
+-	Assert(seekpos < (off_t) BLCKSZ * RELSEG_SIZE);
+-
+-	(void) FileCached(v->mdfd_vfd, seekpos, BLCKSZ, WAIT_EVENT_DATA_FILE_PREFETCH);
+-#endif							/* USE_PREFETCH */
+-
+-	return true;
+-}
+-
+ /*
+  * mdread() -- Read the specified block from a relation.
+  */
+diff --git a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
+index 209518aae01..5d0f3d515c3 100644
+--- a/src/backend/storage/smgr/smgr.c
++++ b/src/backend/storage/smgr/smgr.c
+@@ -55,8 +55,6 @@ typedef struct f_smgr
+ 									BlockNumber blocknum, int nblocks, bool skipFsync);
+ 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
+ 								  BlockNumber blocknum);
+-	bool		(*smgr_cached) (SMgrRelation reln, ForkNumber forknum,
+-								BlockNumber blocknum);
+ 	void		(*smgr_read) (SMgrRelation reln, ForkNumber forknum,
+ 							  BlockNumber blocknum, void *buffer);
+ 	void		(*smgr_write) (SMgrRelation reln, ForkNumber forknum,
+@@ -82,7 +80,6 @@ static const f_smgr smgrsw[] = {
+ 		.smgr_extend = mdextend,
+ 		.smgr_zeroextend = mdzeroextend,
+ 		.smgr_prefetch = mdprefetch,
+-		.smgr_cached = mdcached,
+ 		.smgr_read = mdread,
+ 		.smgr_write = mdwrite,
+ 		.smgr_writeback = mdwriteback,
+@@ -553,22 +550,6 @@ smgrprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+ 	return smgrsw[reln->smgr_which].smgr_prefetch(reln, forknum, blocknum);
+ }
+ 
+-/*
+- * smgrcached() -- Check if the specified block is already in page cache.
+- */
+-bool
+-smgrcached(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+-{
+-	/*
+-	 * In recovery we consider the blocks not cached, so that PrefetchSharedBuffer
+-	 * initiates the I/O. XLogPrefetcherNextBlock relies on that.
+-	 */
+-	if (InRecovery)
+-		return false;
+-
+-	return smgrsw[reln->smgr_which].smgr_cached(reln, forknum, blocknum);
+-}
+-
+ /*
+  * smgrread() -- read a particular block from a relation into the supplied
+  *				 buffer.
+diff --git a/src/include/access/genam.h b/src/include/access/genam.h
+index db1dc9c44b6..b5dbe971770 100644
+--- a/src/include/access/genam.h
++++ b/src/include/access/genam.h
+@@ -247,7 +247,23 @@ typedef struct PrefetchCacheEntry {
+ } PrefetchCacheEntry;
+ 
+ /*
+- * Used to detect sequential patterns (to not prefetch in this case).
++ * Size of the cache of recently prefetched blocks - shouldn't be too
++ * small or too large. 1024 seems about right, it covers ~8MB of data.
++ * It's somewhat arbitrary, there's no particular formula saying it
++ * should not be higher/lower.
++ *
++ * The cache is structured as an array of small LRU caches, so the total
++ * size needs to be a multiple of LRU size. The LRU should be tiny to
++ * keep linear search cheap enough.
++ *
++ * XXX Maybe we could consider effective_cache_size or something?
++ */
++#define		PREFETCH_LRU_SIZE		8
++#define		PREFETCH_LRU_COUNT		128
++#define		PREFETCH_CACHE_SIZE		(PREFETCH_LRU_SIZE * PREFETCH_LRU_COUNT)
++
++/*
++ * Used to detect sequential patterns (and disable prefetching).
+  */
+ #define		PREFETCH_QUEUE_HISTORY			8
+ #define		PREFETCH_SEQ_PATTERN_BLOCKS		4
+@@ -303,6 +319,13 @@ typedef struct IndexPrefetchData
+ 	uint64			blockIndex;	/* index in the block (points to the first
+ 								 * empty entry)*/
+ 
++	/*
++	 * Cache of recently prefetched blocks, organized as a hash table of
++	 * small LRU caches.
++	 */
++	uint64				prefetchReqNumber;
++	PrefetchCacheEntry	prefetchCache[PREFETCH_CACHE_SIZE];
++
+ } IndexPrefetchData;
+ 
+ #define PREFETCH_QUEUE_INDEX(a)	((a) % (MAX_IO_CONCURRENCY))
+diff --git a/src/include/storage/fd.h b/src/include/storage/fd.h
+index c96a24dddd3..d9d5d9da5fb 100644
+--- a/src/include/storage/fd.h
++++ b/src/include/storage/fd.h
+@@ -105,7 +105,6 @@ extern File PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fil
+ extern File OpenTemporaryFile(bool interXact);
+ extern void FileClose(File file);
+ extern int	FilePrefetch(File file, off_t offset, off_t amount, uint32 wait_event_info);
+-extern bool	FileCached(File file, off_t offset, off_t amount, uint32 wait_event_info);
+ extern int	FileRead(File file, void *buffer, size_t amount, off_t offset, uint32 wait_event_info);
+ extern int	FileWrite(File file, const void *buffer, size_t amount, off_t offset, uint32 wait_event_info);
+ extern int	FileSync(File file, uint32 wait_event_info);
+diff --git a/src/include/storage/md.h b/src/include/storage/md.h
+index 8dc1382471e..941879ee6a8 100644
+--- a/src/include/storage/md.h
++++ b/src/include/storage/md.h
+@@ -32,8 +32,6 @@ extern void mdzeroextend(SMgrRelation reln, ForkNumber forknum,
+ 						 BlockNumber blocknum, int nblocks, bool skipFsync);
+ extern bool mdprefetch(SMgrRelation reln, ForkNumber forknum,
+ 					   BlockNumber blocknum);
+-extern bool mdcached(SMgrRelation reln, ForkNumber forknum,
+-					   BlockNumber blocknum);
+ extern void mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 				   void *buffer);
+ extern void mdwrite(SMgrRelation reln, ForkNumber forknum,
+diff --git a/src/include/storage/smgr.h b/src/include/storage/smgr.h
+index 7fbed2a4291..a9a179aabac 100644
+--- a/src/include/storage/smgr.h
++++ b/src/include/storage/smgr.h
+@@ -96,8 +96,6 @@ extern void smgrzeroextend(SMgrRelation reln, ForkNumber forknum,
+ 						   BlockNumber blocknum, int nblocks, bool skipFsync);
+ extern bool smgrprefetch(SMgrRelation reln, ForkNumber forknum,
+ 						 BlockNumber blocknum);
+-extern bool smgrcached(SMgrRelation reln, ForkNumber forknum,
+-					   BlockNumber blocknum);
+ extern void smgrread(SMgrRelation reln, ForkNumber forknum,
+ 					 BlockNumber blocknum, void *buffer);
+ extern void smgrwrite(SMgrRelation reln, ForkNumber forknum,
+-- 
+2.42.0
+

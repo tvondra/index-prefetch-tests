@@ -1,0 +1,222 @@
+From 3a25a7534b4fc01bfc0043f027db922ab0b531fb Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Wed, 22 Nov 2023 18:21:45 +0100
+Subject: [PATCH v20231124 3/7] check page cache using preadv2
+
+Call preadv2 with NOWAIT flag, to check if a block already exists in page cache.
+---
+ src/backend/storage/buffer/bufmgr.c | 12 +++++++++
+ src/backend/storage/file/fd.c       | 40 +++++++++++++++++++++++++++++
+ src/backend/storage/smgr/md.c       | 27 +++++++++++++++++++
+ src/backend/storage/smgr/smgr.c     | 19 ++++++++++++++
+ src/include/storage/fd.h            |  1 +
+ src/include/storage/md.h            |  2 ++
+ src/include/storage/smgr.h          |  2 ++
+ 7 files changed, 103 insertions(+)
+
+diff --git a/src/backend/storage/buffer/bufmgr.c b/src/backend/storage/buffer/bufmgr.c
+index f7c67d504cd..74da9c1376b 100644
+--- a/src/backend/storage/buffer/bufmgr.c
++++ b/src/backend/storage/buffer/bufmgr.c
+@@ -567,8 +567,20 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
+ 		/*
+ 		 * Try to initiate an asynchronous read.  This returns false in
+ 		 * recovery if the relation file doesn't exist.
++		 *
++		 * But first check if the block is already present in page cache.
++		 *
++		 * FIXME This breaks prefetch from recovery. Apparently that expects
++		 * the prefetch to initiate the I/O, otherwise it fails with. But
++		 * XLogPrefetcherNextBlock checks initiated_io, and may fail with:
++		 *
++		 * FATAL:  could not prefetch relation 1663/16384/16401 block 83758
++		 *
++		 * So maybe just fake the initiated_io=true in this case? Or not do
++		 * this when in recovery.
+ 		 */
+ 		if ((io_direct_flags & IO_DIRECT_DATA) == 0 &&
++			!smgrcached(smgr_reln, forkNum, blockNum) &&
+ 			smgrprefetch(smgr_reln, forkNum, blockNum))
+ 		{
+ 			result.initiated_io = true;
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index f691ba09321..2c51a3376f3 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -78,6 +78,7 @@
+ #include <sys/resource.h>		/* for getrlimit */
+ #include <sys/stat.h>
+ #include <sys/types.h>
++#include <sys/uio.h>
+ #ifndef WIN32
+ #include <sys/mman.h>
+ #endif
+@@ -2083,6 +2084,45 @@ retry:
+ #endif
+ }
+ 
++/*
++ * FileCached - check if a given range of the file is in page cache.
++ *
++ * XXX relies on preadv2, probably needs to be checked by configure
++ */
++bool
++FileCached(File file, off_t offset, off_t amount, uint32 wait_event_info)
++{
++#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_WILLNEED)
++	int			returnCode;
++	size_t		readlen;
++	char		buffer[BLCKSZ];
++	struct iovec	iov[1];
++
++	Assert(FileIsValid(file));
++
++	DO_DB(elog(LOG, "FilePrefetch: %d (%s) " INT64_FORMAT " " INT64_FORMAT,
++			   file, VfdCache[file].fileName,
++			   (int64) offset, (int64) amount));
++
++	returnCode = FileAccess(file);
++	if (returnCode < 0)
++		return false;
++
++	/* XXX not sure if this ensures proper buffer alignment */
++	iov[0].iov_base = &buffer;
++	iov[0].iov_len = amount;
++
++	pgstat_report_wait_start(wait_event_info);
++	readlen = preadv2(VfdCache[file].fd, iov, 1, offset, RWF_NOWAIT);
++	pgstat_report_wait_end();
++
++	return (readlen == amount);
++#else
++	Assert(FileIsValid(file));
++	return false;
++#endif
++}
++
+ void
+ FileWriteback(File file, off_t offset, off_t nbytes, uint32 wait_event_info)
+ {
+diff --git a/src/backend/storage/smgr/md.c b/src/backend/storage/smgr/md.c
+index fdecbad1709..16a7c424683 100644
+--- a/src/backend/storage/smgr/md.c
++++ b/src/backend/storage/smgr/md.c
+@@ -736,6 +736,33 @@ mdprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+ 	return true;
+ }
+ 
++/*
++ * mdcached() -- Check if the whole block is already available in page cache.
++ */
++bool
++mdcached(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
++{
++#ifdef USE_PREFETCH
++	off_t		seekpos;
++	MdfdVec    *v;
++
++	Assert((io_direct_flags & IO_DIRECT_DATA) == 0);
++
++	v = _mdfd_getseg(reln, forknum, blocknum, false,
++					 InRecovery ? EXTENSION_RETURN_NULL : EXTENSION_FAIL);
++	if (v == NULL)
++		return false;
++
++	seekpos = (off_t) BLCKSZ * (blocknum % ((BlockNumber) RELSEG_SIZE));
++
++	Assert(seekpos < (off_t) BLCKSZ * RELSEG_SIZE);
++
++	(void) FileCached(v->mdfd_vfd, seekpos, BLCKSZ, WAIT_EVENT_DATA_FILE_PREFETCH);
++#endif							/* USE_PREFETCH */
++
++	return true;
++}
++
+ /*
+  * mdread() -- Read the specified block from a relation.
+  */
+diff --git a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
+index 5d0f3d515c3..209518aae01 100644
+--- a/src/backend/storage/smgr/smgr.c
++++ b/src/backend/storage/smgr/smgr.c
+@@ -55,6 +55,8 @@ typedef struct f_smgr
+ 									BlockNumber blocknum, int nblocks, bool skipFsync);
+ 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
+ 								  BlockNumber blocknum);
++	bool		(*smgr_cached) (SMgrRelation reln, ForkNumber forknum,
++								BlockNumber blocknum);
+ 	void		(*smgr_read) (SMgrRelation reln, ForkNumber forknum,
+ 							  BlockNumber blocknum, void *buffer);
+ 	void		(*smgr_write) (SMgrRelation reln, ForkNumber forknum,
+@@ -80,6 +82,7 @@ static const f_smgr smgrsw[] = {
+ 		.smgr_extend = mdextend,
+ 		.smgr_zeroextend = mdzeroextend,
+ 		.smgr_prefetch = mdprefetch,
++		.smgr_cached = mdcached,
+ 		.smgr_read = mdread,
+ 		.smgr_write = mdwrite,
+ 		.smgr_writeback = mdwriteback,
+@@ -550,6 +553,22 @@ smgrprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+ 	return smgrsw[reln->smgr_which].smgr_prefetch(reln, forknum, blocknum);
+ }
+ 
++/*
++ * smgrcached() -- Check if the specified block is already in page cache.
++ */
++bool
++smgrcached(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
++{
++	/*
++	 * In recovery we consider the blocks not cached, so that PrefetchSharedBuffer
++	 * initiates the I/O. XLogPrefetcherNextBlock relies on that.
++	 */
++	if (InRecovery)
++		return false;
++
++	return smgrsw[reln->smgr_which].smgr_cached(reln, forknum, blocknum);
++}
++
+ /*
+  * smgrread() -- read a particular block from a relation into the supplied
+  *				 buffer.
+diff --git a/src/include/storage/fd.h b/src/include/storage/fd.h
+index d9d5d9da5fb..c96a24dddd3 100644
+--- a/src/include/storage/fd.h
++++ b/src/include/storage/fd.h
+@@ -105,6 +105,7 @@ extern File PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fil
+ extern File OpenTemporaryFile(bool interXact);
+ extern void FileClose(File file);
+ extern int	FilePrefetch(File file, off_t offset, off_t amount, uint32 wait_event_info);
++extern bool	FileCached(File file, off_t offset, off_t amount, uint32 wait_event_info);
+ extern int	FileRead(File file, void *buffer, size_t amount, off_t offset, uint32 wait_event_info);
+ extern int	FileWrite(File file, const void *buffer, size_t amount, off_t offset, uint32 wait_event_info);
+ extern int	FileSync(File file, uint32 wait_event_info);
+diff --git a/src/include/storage/md.h b/src/include/storage/md.h
+index 941879ee6a8..8dc1382471e 100644
+--- a/src/include/storage/md.h
++++ b/src/include/storage/md.h
+@@ -32,6 +32,8 @@ extern void mdzeroextend(SMgrRelation reln, ForkNumber forknum,
+ 						 BlockNumber blocknum, int nblocks, bool skipFsync);
+ extern bool mdprefetch(SMgrRelation reln, ForkNumber forknum,
+ 					   BlockNumber blocknum);
++extern bool mdcached(SMgrRelation reln, ForkNumber forknum,
++					   BlockNumber blocknum);
+ extern void mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 				   void *buffer);
+ extern void mdwrite(SMgrRelation reln, ForkNumber forknum,
+diff --git a/src/include/storage/smgr.h b/src/include/storage/smgr.h
+index a9a179aabac..7fbed2a4291 100644
+--- a/src/include/storage/smgr.h
++++ b/src/include/storage/smgr.h
+@@ -96,6 +96,8 @@ extern void smgrzeroextend(SMgrRelation reln, ForkNumber forknum,
+ 						   BlockNumber blocknum, int nblocks, bool skipFsync);
+ extern bool smgrprefetch(SMgrRelation reln, ForkNumber forknum,
+ 						 BlockNumber blocknum);
++extern bool smgrcached(SMgrRelation reln, ForkNumber forknum,
++					   BlockNumber blocknum);
+ extern void smgrread(SMgrRelation reln, ForkNumber forknum,
+ 					 BlockNumber blocknum, void *buffer);
+ extern void smgrwrite(SMgrRelation reln, ForkNumber forknum,
+-- 
+2.42.0
+

@@ -1,0 +1,237 @@
+From 58a3cea898f810aa4646e6327c5e0241e6886e66 Mon Sep 17 00:00:00 2001
+From: Tomas Vondra <tomas.vondra@postgresql.org>
+Date: Thu, 23 Nov 2023 00:47:17 +0100
+Subject: [PATCH v20231124 6/7] poc: reuse vm information
+
+---
+ src/backend/access/index/indexam.c       | 59 ++++++++++++++++--------
+ src/backend/executor/nodeIndexonlyscan.c |  8 +++-
+ src/include/access/genam.h               | 12 +++--
+ 3 files changed, 56 insertions(+), 23 deletions(-)
+
+diff --git a/src/backend/access/index/indexam.c b/src/backend/access/index/indexam.c
+index 53948986ada..45c97aff5ef 100644
+--- a/src/backend/access/index/indexam.c
++++ b/src/backend/access/index/indexam.c
+@@ -113,8 +113,8 @@ static IndexScanDesc index_beginscan_internal(Relation indexRelation,
+ 											  int prefetch_max);
+ 
+ static void index_prefetch_tids(IndexScanDesc scan, ScanDirection direction);
+-static ItemPointer index_prefetch_get_tid(IndexScanDesc scan, ScanDirection direction);
+-static void index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible);
++static ItemPointer index_prefetch_get_tid(IndexScanDesc scan, ScanDirection direction, bool *all_visible);
++static void index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible, bool *all_visible);
+ 
+ 
+ /* ----------------------------------------------------------------
+@@ -721,10 +721,11 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
+ 
+ 		if (!scan->xs_heap_continue)
+ 		{
+-			ItemPointer tid;
++			ItemPointer	tid;
++			bool		all_visible;
+ 
+ 			/* Time to fetch the next TID from the index */
+-			tid = index_prefetch_get_tid(scan, direction);
++			tid = index_prefetch_get_tid(scan, direction, &all_visible);
+ 
+ 			/* If we're out of index entries, we're done */
+ 			if (tid == NULL)
+@@ -1238,12 +1239,15 @@ index_prefetch_is_sequential(IndexPrefetch prefetch, BlockNumber block)
+  * in BTScanPosData.nextPage.
+  */
+ static void
+-index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible)
++index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible, bool *all_visible)
+ {
+ 	IndexPrefetch prefetch = scan->xs_prefetch;
+ 	BlockNumber block;
+ 	PrefetchBufferResult result;
+ 
++	/* by default not all visible (or we didn't check) */
++	*all_visible = false;
++
+ 	/*
+ 	 * No heap relation means bitmap index scan, which does prefetching at the
+ 	 * bitmap heap scan, so no prefetch here (we can't do it anyway, without
+@@ -1275,16 +1279,19 @@ index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible)
+ 	 * we can propagate it here). Or at least do it for a bulk of prefetches,
+ 	 * although that's not very useful - after the ramp-up we will prefetch
+ 	 * the pages one by one anyway.
++	 *
++	 * XXX Ideally we'd also propagate this to the executor, so that the
++	 * nodeIndexonlyscan.c doesn't need to repeat the same VM check (which
++	 * is measurable). But the index_getnext_tid() is not really well
++	 * suited for that, so the API needs a change.s
+ 	 */
+ 	if (skip_all_visible)
+ 	{
+-		bool	all_visible;
++		*all_visible = VM_ALL_VISIBLE(scan->heapRelation,
++									  block,
++									  &prefetch->vmBuffer);
+ 
+-		all_visible = VM_ALL_VISIBLE(scan->heapRelation,
+-									 block,
+-									 &prefetch->vmBuffer);
+-
+-		if (all_visible)
++		if (*all_visible)
+ 			return;
+ 	}
+ 
+@@ -1336,11 +1343,23 @@ index_prefetch(IndexScanDesc scan, ItemPointer tid, bool skip_all_visible)
+ ItemPointer
+ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
+ {
++	bool		all_visible;	/* ignored */
++
+ 	/* Do prefetching (if requested/enabled). */
+ 	index_prefetch_tids(scan, direction);
+ 
+ 	/* Read the TID from the queue (or directly from the index). */
+-	return index_prefetch_get_tid(scan, direction);
++	return index_prefetch_get_tid(scan, direction, &all_visible);
++}
++
++ItemPointer
++index_getnext_tid_vm(IndexScanDesc scan, ScanDirection direction, bool *all_visible)
++{
++	/* Do prefetching (if requested/enabled). */
++	index_prefetch_tids(scan, direction);
++
++	/* Read the TID from the queue (or directly from the index). */
++	return index_prefetch_get_tid(scan, direction, all_visible);
+ }
+ 
+ static void
+@@ -1374,6 +1393,7 @@ index_prefetch_tids(IndexScanDesc scan, ScanDirection direction)
+ 		while (!PREFETCH_FULL(prefetch))
+ 		{
+ 			ItemPointer tid;
++			bool		all_visible;
+ 
+ 			/* Time to fetch the next TID from the index */
+ 			tid = index_getnext_tid_internal(scan, direction);
+@@ -1390,22 +1410,23 @@ index_prefetch_tids(IndexScanDesc scan, ScanDirection direction)
+ 
+ 			Assert(ItemPointerEquals(tid, &scan->xs_heaptid));
+ 
+-			prefetch->queueItems[PREFETCH_QUEUE_INDEX(prefetch->queueEnd)] = *tid;
+-			prefetch->queueEnd++;
+-
+ 			/*
+ 			 * Issue the actuall prefetch requests for the new TID.
+ 			 *
+ 			 * XXX index_getnext_tid_prefetch is only called for IOS (for now),
+ 			 * so skip prefetching of all-visible pages.
+ 			 */
+-			index_prefetch(scan, tid, scan->indexonly);
++			index_prefetch(scan, tid, scan->indexonly, &all_visible);
++
++			prefetch->queueItems[PREFETCH_QUEUE_INDEX(prefetch->queueEnd)].tid = *tid;
++			prefetch->queueItems[PREFETCH_QUEUE_INDEX(prefetch->queueEnd)].all_visible = all_visible;
++			prefetch->queueEnd++;
+ 		}
+ 	}
+ }
+ 
+ static ItemPointer
+-index_prefetch_get_tid(IndexScanDesc scan, ScanDirection direction)
++index_prefetch_get_tid(IndexScanDesc scan, ScanDirection direction, bool *all_visible)
+ {
+ 	/* for convenience */
+ 	IndexPrefetch prefetch = scan->xs_prefetch;
+@@ -1422,7 +1443,8 @@ index_prefetch_get_tid(IndexScanDesc scan, ScanDirection direction)
+ 		if (PREFETCH_DONE(prefetch))
+ 			return NULL;
+ 
+-		scan->xs_heaptid = prefetch->queueItems[PREFETCH_QUEUE_INDEX(prefetch->queueIndex)];
++		scan->xs_heaptid = prefetch->queueItems[PREFETCH_QUEUE_INDEX(prefetch->queueIndex)].tid;
++		*all_visible = prefetch->queueItems[PREFETCH_QUEUE_INDEX(prefetch->queueIndex)].all_visible;
+ 		prefetch->queueIndex++;
+ 	}
+ 	else				/* not prefetching, just do the regular work  */
+@@ -1431,6 +1453,7 @@ index_prefetch_get_tid(IndexScanDesc scan, ScanDirection direction)
+ 
+ 		/* Time to fetch the next TID from the index */
+ 		tid = index_getnext_tid_internal(scan, direction);
++		*all_visible = false;
+ 
+ 		/* If we're out of index entries, we're done */
+ 		if (tid == NULL)
+diff --git a/src/backend/executor/nodeIndexonlyscan.c b/src/backend/executor/nodeIndexonlyscan.c
+index 60cb772344f..b6660c10a63 100644
+--- a/src/backend/executor/nodeIndexonlyscan.c
++++ b/src/backend/executor/nodeIndexonlyscan.c
+@@ -66,6 +66,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
+ 	TupleTableSlot *slot;
+ 	ItemPointer tid;
+ 	Relation	heapRel = node->ss.ss_currentRelation;
++	bool		all_visible;
+ 
+ 	/*
+ 	 * extract necessary information from index scan node
+@@ -148,7 +149,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
+ 	/*
+ 	 * OK, now that we have what we need, fetch the next tuple.
+ 	 */
+-	while ((tid = index_getnext_tid(scandesc, direction)) != NULL)
++	while ((tid = index_getnext_tid_vm(scandesc, direction, &all_visible)) != NULL)
+ 	{
+ 		bool		tuple_from_heap = false;
+ 
+@@ -187,8 +188,11 @@ IndexOnlyNext(IndexOnlyScanState *node)
+ 		 *
+ 		 * It's worth going through this complexity to avoid needing to lock
+ 		 * the VM buffer, which could cause significant contention.
++		 *
++		 * XXX Skip if we already know the page is all visible from prefetcher.
+ 		 */
+-		if (!VM_ALL_VISIBLE(scandesc->heapRelation,
++		if (!all_visible &&
++			!VM_ALL_VISIBLE(scandesc->heapRelation,
+ 							ItemPointerGetBlockNumber(tid),
+ 							&node->ioss_VMBuffer))
+ 		{
+diff --git a/src/include/access/genam.h b/src/include/access/genam.h
+index 8a3be673730..db1dc9c44b6 100644
+--- a/src/include/access/genam.h
++++ b/src/include/access/genam.h
+@@ -175,8 +175,9 @@ extern IndexScanDesc index_beginscan_parallel(Relation heaprel,
+ 											  int prefetch_max);
+ extern ItemPointer index_getnext_tid(IndexScanDesc scan,
+ 									 ScanDirection direction);
+-extern ItemPointer index_getnext_tid_prefetch(IndexScanDesc scan,
+-											  ScanDirection direction);
++extern ItemPointer index_getnext_tid_vm(IndexScanDesc scan,
++										ScanDirection direction,
++										bool *all_visible);
+ struct TupleTableSlot;
+ extern bool index_fetch_heap(IndexScanDesc scan, struct TupleTableSlot *slot);
+ extern bool index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
+@@ -251,6 +252,11 @@ typedef struct PrefetchCacheEntry {
+ #define		PREFETCH_QUEUE_HISTORY			8
+ #define		PREFETCH_SEQ_PATTERN_BLOCKS		4
+ 
++typedef struct PrefetchEntry
++{
++	ItemPointerData		tid;
++	bool				all_visible;
++} PrefetchEntry;
+ 
+ typedef struct IndexPrefetchData
+ {
+@@ -279,7 +285,7 @@ typedef struct IndexPrefetchData
+ 	 * XXX Sizing for MAX_IO_CONCURRENCY may be overkill, but it seems simpler
+ 	 * than dynamically adjusting for custom values.
+ 	 */
+-	ItemPointerData	queueItems[MAX_IO_CONCURRENCY];
++	PrefetchEntry	queueItems[MAX_IO_CONCURRENCY];
+ 	uint64			queueIndex;	/* next TID to prefetch */
+ 	uint64			queueStart;	/* first valid TID in queue */
+ 	uint64			queueEnd;	/* first invalid (empty) TID in queue */
+-- 
+2.42.0
+
